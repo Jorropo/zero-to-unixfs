@@ -9,6 +9,7 @@ import (
 	"os"
 
 	"github.com/ipfs/go-cid"
+	cbor "github.com/ipfs/go-ipld-cbor"
 	"github.com/multiformats/go-multicodec"
 	mh "github.com/multiformats/go-multihash"
 )
@@ -20,6 +21,13 @@ func init() {
 	c(err)
 	cidPrecomputed := cid.NewCidV1(uint64(multicodec.Raw), mh)
 	cidSize = cidPrecomputed.ByteLen()
+
+	cbor.RegisterCborType(CarHeader{})
+}
+
+type CarHeader struct {
+	Roots   []cid.Cid
+	Version uint64
 }
 
 const tempFileName = ".temp"
@@ -37,7 +45,34 @@ func main() {
 		tempCar: tempCar,
 	}
 
-	fmt.Println(r.add(source))
+	root := r.add(source)
+
+	outputCar, err := os.OpenFile(os.Args[2], os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0622)
+	c(err)
+	defer outputCar.Close()
+
+	headerData, err := cbor.DumpObject(CarHeader{
+		Roots:   []cid.Cid{root},
+		Version: 1,
+	})
+
+	varintHeaderBuffer := make([]byte, binary.MaxVarintLen64)
+	varuintSize := binary.PutUvarint(varintHeaderBuffer, uint64(len(headerData)))
+	varintHeaderBuffer = varintHeaderBuffer[:varuintSize]
+
+	_, err = outputCar.Write(varintHeaderBuffer)
+	c(err)
+
+	_, err = outputCar.Write(headerData)
+	c(err)
+
+	_, err = r.tempCar.Seek(0, io.SeekStart)
+	c(err)
+
+	_, err = outputCar.ReadFrom(tempCar)
+	c(err)
+
+	fmt.Println(root)
 }
 
 type recurse struct {
