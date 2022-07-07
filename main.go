@@ -8,6 +8,9 @@ import (
 	"io/fs"
 	"os"
 
+	pb "github.com/Jorropo/zero-to-unixfs/pb"
+	proto "google.golang.org/protobuf/proto"
+
 	"github.com/ipfs/go-cid"
 	cbor "github.com/ipfs/go-ipld-cbor"
 	"github.com/multiformats/go-multicodec"
@@ -31,6 +34,8 @@ type CarHeader struct {
 }
 
 const tempFileName = ".temp"
+const blockSize = 1024 * 1024 // 1MiB
+const fanOutSize = 5
 
 func main() {
 	tempCar, err := os.OpenFile(tempFileName, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0622)
@@ -92,11 +97,122 @@ func (r recurse) add(source *os.File) cid.Cid {
 	}
 }
 
-func (r recurse) addFile(source *os.File, stat fs.FileInfo) cid.Cid {
-	fileSize := uint64(stat.Size())
+func (r recurse) addFile(source *os.File, fileInfo fs.FileInfo) cid.Cid {
+	fileSize := fileInfo.Size()
 
+	var leavesBlock uint64
+	if fileSize == 0 {
+		leavesBlock = 1
+	} else {
+		// Div round up
+		// fileSize = 10
+		// blockSize = 5
+		// Let's assume we do 9 / 5
+		// 9 - 1 = 8
+		// 8 / 5 = 1
+		// 1 + 1 = 2 = roundup(10 / 5)
+		leavesBlock = (uint64(fileSize)-1)/blockSize + 1
+	}
+
+	leaves := make([]cidSizePair, leavesBlock)
+	for i := range leaves {
+		leafSize := uint64(blockSize)
+		if uint64(i) == leavesBlock-1 { // last block
+			leafSize = uint64(fileSize) % blockSize
+		}
+		leaves[i] = r.addBlock(source, leafSize)
+	}
+
+	roots := leaves
+	for len(roots) > 1 {
+		leaves = roots
+		roots = nil
+		for len(leaves) > 1 {
+
+			// avoid links to nothing if there is less leaves than the fanOutSize
+			linkCount := fanOutSize
+			if len(leaves) < linkCount {
+				linkCount = len(leaves)
+			}
+
+			blocksizes := make([]uint64, linkCount)
+			links := make([]*pb.PBLink, linkCount)
+			var fileSize uint64
+			var dagSize uint64
+
+			for i, v := range leaves[:linkCount] {
+				fileSize += v.fileSize
+				dagSize += v.dagSize
+				links[i] = &pb.PBLink{
+					Hash:  v.c.Bytes(),
+					Tsize: &v.dagSize,
+				}
+				blocksizes[i] = v.fileSize
+			}
+
+			t := pb.UnixfsData_File
+			rootData := &pb.UnixfsData{
+				Type:       &t,
+				Filesize:   &fileSize,
+				Blocksizes: blocksizes,
+			}
+			unixfsData, err := proto.Marshal(rootData)
+			c(err)
+
+			root := &pb.PBNode{
+				Data:  unixfsData,
+				Links: links,
+			}
+			rootBuffer, err := proto.Marshal(root)
+			c(err)
+			hasher := sha256.New()
+			hasher.Write(rootBuffer)
+
+			rootMultihash, err := mh.Encode(hasher.Sum(nil), mh.SHA2_256)
+			c(err)
+
+			rootCid := cid.NewCidV1(cid.DagProtobuf, rootMultihash)
+
+			elementSize := uint64(len(rootBuffer)) + uint64(rootCid.ByteLen())
+
+			varuintRootCid := make([]byte, binary.MaxVarintLen64)
+			varuintSize := binary.PutUvarint(varuintRootCid, elementSize)
+			varuintRootCid = varuintRootCid[:varuintSize]
+
+			_, err = r.tempCar.Write(varuintRootCid)
+			c(err)
+			_, err = r.tempCar.Write(rootCid.Bytes())
+			c(err)
+			_, err = r.tempCar.Write(rootBuffer)
+			c(err)
+
+			dagSize += uint64(len(rootBuffer))
+
+			roots = append(roots, cidSizePair{
+				c:        rootCid,
+				fileSize: fileSize,
+				dagSize:  dagSize,
+			})
+			leaves = leaves[linkCount:]
+		}
+		if len(leaves) == 1 {
+			roots = append(roots, leaves[0])
+		}
+	}
+	return roots[0].c
+}
+
+type cidSizePair struct {
+	c        cid.Cid
+	fileSize uint64
+	// dag size is the size of all the blocks
+	// containing protobuf and linking overhead
+	dagSize uint64
+}
+
+func (r recurse) addBlock(source *os.File, blockSize uint64) cidSizePair {
 	// Element is CID + block
-	elementSize := fileSize + uint64(cidSize)
+	elementSize := blockSize + uint64(cidSize)
 
 	varuintEmptyCidBuffer := make([]byte, binary.MaxVarintLen64+cidSize)
 	varuintSize := binary.PutUvarint(varuintEmptyCidBuffer, elementSize)
@@ -106,7 +222,7 @@ func (r recurse) addFile(source *os.File, stat fs.FileInfo) cid.Cid {
 	c(err)
 
 	blockHasher := sha256.New()
-	_, err = io.Copy(r.tempCar, io.TeeReader(source, blockHasher))
+	_, err = io.CopyN(r.tempCar, io.TeeReader(source, blockHasher), int64(blockSize))
 	c(err)
 
 	fileMh, err := mh.Encode(blockHasher.Sum(nil), mh.SHA2_256)
@@ -119,7 +235,7 @@ func (r recurse) addFile(source *os.File, stat fs.FileInfo) cid.Cid {
 	_, err = r.tempCar.WriteAt(blockCid.Bytes(), offset-int64(elementSize))
 	c(err)
 
-	return blockCid
+	return cidSizePair{blockCid, blockSize, blockSize}
 }
 
 func c(e error) {
