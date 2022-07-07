@@ -119,6 +119,9 @@ func (r recurse) addFile(source *os.File, fileInfo fs.FileInfo) cid.Cid {
 		leafSize := uint64(blockSize)
 		if uint64(i) == leavesBlock-1 { // last block
 			leafSize = uint64(fileSize) % blockSize
+			if leafSize == 0 {
+				leafSize = blockSize
+			}
 		}
 		leaves[i] = r.addBlock(source, leafSize)
 	}
